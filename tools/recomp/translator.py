@@ -2767,6 +2767,8 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+        # The guest memory base, read once (recomp_types.h, RECOMP_MEM_BASE).
+        lines.append("    RECOMP_MEM_BASE_DECL")
         if func_addr in ENTRY_HOOKS:
             lines.append(f"    extern void sub_{func_addr:08X}_enter(void);")
             lines.append(f"    sub_{func_addr:08X}_enter();")
@@ -3411,6 +3413,7 @@ class BatchTranslator:
         c_chunks.append(" */")
         c_chunks.append("")
         c_chunks.append('#define RECOMP_GENERATED_CODE')
+        c_chunks.append('#define RECOMP_LOCAL_MEM_BASE')
         c_chunks.append('#include "recomp_types.h"')
         c_chunks.append('#include <math.h>')
         c_chunks.append("")
@@ -3702,6 +3705,7 @@ class BatchTranslator:
                 " */",
                 "",
                 "#define RECOMP_GENERATED_CODE",
+                "#define RECOMP_LOCAL_MEM_BASE",
                 f'#include "{header_name}"',
                 '#include <math.h>',
                 "",
