@@ -451,9 +451,13 @@ void recomp_trace_esp(const char *name, const char *tag);
  * A function-local declaration would also shadow these, and the local
  * starts zeroed -- a returned float would silently read as 0.0.
  *
- * The helpers are lane-wise C rather than host intrinsics: the guest
- * semantics stay explicit (MINPS returning src on unordered, CMPNEQPS
- * being the unordered form) and the header stays portable.
+ * Upstream writes the helpers as lane-wise C rather than host intrinsics,
+ * so the guest semantics stay explicit (MINPS returning src on unordered,
+ * CMPNEQPS being the unordered form) and the header stays portable. This
+ * copy (reJSRF's fork, branch perf/xmm-intrinsics; kept local, not proposed
+ * upstream) uses SSE2 intrinsics for the common helpers when the compiler
+ * targets SSE2 and keeps the lane-wise C as the RECOMP_XMM_PORTABLE and
+ * non-SSE2 path; see the block below for why and what differs.
  * ================================================================ */
 
 #ifndef RECOMP_XMM_DEFINED
@@ -494,7 +498,11 @@ extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
  * instructions themselves, so their results are the guest's. RecompXmm
  * keeps its 8-byte alignment (MSVC x86 cannot pass 16-byte aligned types
  * by value), so values cross the boundary with unaligned 16-byte moves.
- * RSQRT/RCP and the compare-predicate form stay plain C in both modes. */
+ * RSQRT/RCP and the compare-predicate form stay plain C in both modes.
+ * Guest loads and stores here are single unaligned 16- or 8-byte accesses
+ * through a plain pointer, as the guest instruction made them, where the C
+ * form used volatile 32-bit accesses; the compiler may combine or reorder
+ * them with other non-volatile accesses. */
 static inline __m128 recomp_xmm_get(RecompXmm a) { return _mm_loadu_ps(a.f); }
 static inline RecompXmm recomp_xmm_put(__m128 v) { RecompXmm r; _mm_storeu_ps(r.f, v); return r; }
 
