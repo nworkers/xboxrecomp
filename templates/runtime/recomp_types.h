@@ -556,6 +556,127 @@ typedef union RecompXmm {
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 
+#if !defined(RECOMP_XMM_PORTABLE) && (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) \
+    || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define RECOMP_XMM_SSE 1
+#include <emmintrin.h>
+#endif
+
+#define RECOMP_XMM_LANEWISE(name, expr)                                   \
+    static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \
+        RecompXmm r; int i;                                               \
+        for (i = 0; i < 4; ++i) { (void)a; (void)b; r.f[i] = (expr); }    \
+        return r;                                                         \
+    }
+
+#ifdef RECOMP_XMM_SSE
+
+/* SSE2 intrinsics for the packed helpers, where the compiler targets SSE2
+ * (MSVC x86 does by default; define RECOMP_XMM_PORTABLE to keep plain C).
+ * The plain C forms build a RecompXmm lane by lane, and MSVC turns that into
+ * partial stores to a stack temporary followed by a full 16-byte load: a
+ * failed store-to-load forward on every movss, mulps and shufps, the
+ * hottest instructions in a title's vector code. The intrinsics are the
+ * instructions themselves, so their results are the guest's. RecompXmm
+ * keeps its 8-byte alignment (MSVC x86 cannot pass 16-byte aligned types
+ * by value), so values cross the boundary with unaligned 16-byte moves.
+ * RSQRT/RCP and the compare-predicate form stay plain C in both modes. */
+static inline __m128 recomp_xmm_get(RecompXmm a) { return _mm_loadu_ps(a.f); }
+static inline RecompXmm recomp_xmm_put(__m128 v) { RecompXmm r; _mm_storeu_ps(r.f, v); return r; }
+
+/* -- construction -- */
+
+static inline RecompXmm XMM_ZERO(void) { return recomp_xmm_put(_mm_setzero_ps()); }
+
+/** movss from memory: lane 0 set, upper lanes zeroed. */
+static inline RecompXmm XMM_SCALAR(float v) { return recomp_xmm_put(_mm_set_ss(v)); }
+
+/** movsd from memory: low double set, high double zeroed. */
+static inline RecompXmm XMM_SCALAR_DOUBLE(double v) {
+    return recomp_xmm_put(_mm_castpd_ps(_mm_set_sd(v)));
+}
+
+/** movd: 32 raw bits into lane 0, upper lanes zeroed. */
+static inline RecompXmm XMM_SCALAR_BITS(uint32_t bits) {
+    return recomp_xmm_put(_mm_castsi128_ps(_mm_cvtsi32_si128((int)bits)));
+}
+
+/* -- guest memory --
+ * Macros, so the address goes through XBOX_PTR at the use site (a translated
+ * function's own memory base). One unaligned 16- or 8-byte access, as the
+ * guest instruction made. */
+
+static inline RecompXmm recomp_xmm_load(const void *p) { return recomp_xmm_put(_mm_loadu_ps((const float *)p)); }
+static inline void recomp_xmm_store(void *p, RecompXmm v) { _mm_storeu_ps((float *)p, recomp_xmm_get(v)); }
+#define XMM_MEM(addr)        recomp_xmm_load((const void *)XBOX_PTR(addr))
+#define XMM_STORE(addr, v)   recomp_xmm_store((void *)XBOX_PTR(addr), (v))
+
+/* movlps/movhps move 8 bytes into or out of one half, leaving the
+ * other half alone. */
+#define XMM_LOAD_LOW(dst, addr) \
+    ((dst) = recomp_xmm_put(_mm_loadl_pi(recomp_xmm_get(dst), (const __m64 *)XBOX_PTR(addr))))
+#define XMM_LOAD_HIGH(dst, addr) \
+    ((dst) = recomp_xmm_put(_mm_loadh_pi(recomp_xmm_get(dst), (const __m64 *)XBOX_PTR(addr))))
+#define XMM_STORE_LOW(addr, src)  _mm_storel_pi((__m64 *)XBOX_PTR(addr), recomp_xmm_get(src))
+#define XMM_STORE_HIGH(addr, src) _mm_storeh_pi((__m64 *)XBOX_PTR(addr), recomp_xmm_get(src))
+
+/** movlhps: dst high = src low. */
+static inline RecompXmm XMM_MOVE_LOW_TO_HIGH(RecompXmm a, RecompXmm b) {
+    return recomp_xmm_put(_mm_movelh_ps(recomp_xmm_get(a), recomp_xmm_get(b)));
+}
+
+/** movhlps: dst low = src high. */
+static inline RecompXmm XMM_MOVE_HIGH_TO_LOW(RecompXmm a, RecompXmm b) {
+    return recomp_xmm_put(_mm_movehl_ps(recomp_xmm_get(a), recomp_xmm_get(b)));
+}
+
+/* -- packed arithmetic, bitwise, compares -- */
+
+#define RECOMP_XMM_SSE_BINARY(name, op)                                   \
+    static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \
+        return recomp_xmm_put(op(recomp_xmm_get(a), recomp_xmm_get(b)));  \
+    }
+
+RECOMP_XMM_SSE_BINARY(XMM_ADD, _mm_add_ps)
+RECOMP_XMM_SSE_BINARY(XMM_SUB, _mm_sub_ps)
+RECOMP_XMM_SSE_BINARY(XMM_MUL, _mm_mul_ps)
+RECOMP_XMM_SSE_BINARY(XMM_DIV, _mm_div_ps)
+/* MINPS/MAXPS return the second operand when the lanes are unordered or
+ * equal -- the intrinsics are those instructions. */
+RECOMP_XMM_SSE_BINARY(XMM_MIN, _mm_min_ps)
+RECOMP_XMM_SSE_BINARY(XMM_MAX, _mm_max_ps)
+RECOMP_XMM_SSE_BINARY(XMM_AND, _mm_and_ps)
+RECOMP_XMM_SSE_BINARY(XMM_OR, _mm_or_ps)
+RECOMP_XMM_SSE_BINARY(XMM_XOR, _mm_xor_ps)
+/* ANDNPS is ~dst & src, not dst & ~src; so is _mm_andnot_ps. */
+RECOMP_XMM_SSE_BINARY(XMM_ANDN, _mm_andnot_ps)
+/* EQ/LT/LE are the ordered forms, NEQ the unordered one, as in CMPPS. */
+RECOMP_XMM_SSE_BINARY(XMM_CMP_EQ, _mm_cmpeq_ps)
+RECOMP_XMM_SSE_BINARY(XMM_CMP_LT, _mm_cmplt_ps)
+RECOMP_XMM_SSE_BINARY(XMM_CMP_LE, _mm_cmple_ps)
+RECOMP_XMM_SSE_BINARY(XMM_CMP_NEQ, _mm_cmpneq_ps)
+
+/* Packed unary op; the first argument is unused, as for the binary forms. */
+static inline RecompXmm XMM_SQRT(RecompXmm a, RecompXmm b) {
+    (void)a; return recomp_xmm_put(_mm_sqrt_ps(recomp_xmm_get(b)));
+}
+
+/** movmskps: the four lane sign bits, packed into the low nibble. */
+static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
+    return (uint32_t)_mm_movemask_ps(recomp_xmm_get(a));
+}
+
+/** shufps: lanes 0-1 selected out of `a`, lanes 2-3 out of `b`. A macro:
+ * the selector must be a constant, which the lifter always emits. */
+#define XMM_SHUFFLE(a, b, imm) \
+    recomp_xmm_put(_mm_shuffle_ps(recomp_xmm_get(a), recomp_xmm_get(b), (imm)))
+
+/** unpcklps / unpckhps: interleave the low or high halves. */
+RECOMP_XMM_SSE_BINARY(XMM_UNPACK_LOW, _mm_unpacklo_ps)
+RECOMP_XMM_SSE_BINARY(XMM_UNPACK_HIGH, _mm_unpackhi_ps)
+
+#else /* RECOMP_XMM_SSE */
+
 /* -- construction -- */
 
 static inline RecompXmm XMM_ZERO(void) {
@@ -624,13 +745,6 @@ static inline RecompXmm XMM_MOVE_HIGH_TO_LOW(RecompXmm a, RecompXmm b) {
 
 /* -- packed arithmetic -- */
 
-#define RECOMP_XMM_LANEWISE(name, expr)                                   \
-    static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \
-        RecompXmm r; int i;                                               \
-        for (i = 0; i < 4; ++i) { (void)a; (void)b; r.f[i] = (expr); }    \
-        return r;                                                         \
-    }
-
 RECOMP_XMM_LANEWISE(XMM_ADD, a.f[i] + b.f[i])
 RECOMP_XMM_LANEWISE(XMM_SUB, a.f[i] - b.f[i])
 RECOMP_XMM_LANEWISE(XMM_MUL, a.f[i] * b.f[i])
@@ -661,48 +775,6 @@ RECOMP_XMM_BITWISE(XMM_CMP_LT,  (a.f[i] <  b.f[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_LE,  (a.f[i] <= b.f[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_NEQ, (a.f[i] == b.f[i]) ? 0u : 0xFFFFFFFFu)
 
-/* The full SSE compare predicate set, by CMPPS/CMPSS immediate:
- * 0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ, 5 NLT, 6 NLE, 7 ORD. The N forms are
- * the negations, so they are true when either side is NaN. */
-static inline int recomp_cmp_pred(float a, float b, int p) {
-    switch (p & 7) {
-    case 0:  return a == b;
-    case 1:  return a < b;
-    case 2:  return a <= b;
-    case 3:  return a != a || b != b;
-    case 4:  return !(a == b);
-    case 5:  return !(a < b);
-    case 6:  return !(a <= b);
-    default: return !(a != a || b != b);
-    }
-}
-static inline RecompXmm XMM_CMP_PRED(RecompXmm a, RecompXmm b, int p) {
-    RecompXmm r; int i;
-    for (i = 0; i < 4; ++i)
-        r.u[i] = recomp_cmp_pred(a.f[i], b.f[i], p) ? 0xFFFFFFFFu : 0u;
-    return r;
-}
-/* Packed unary ops; the first argument is unused, as for the binary forms. */
-RECOMP_XMM_LANEWISE(XMM_SQRT,  sqrtf(b.f[i]))
-/* These instructions deliberately approximate and treat denormals as zero.
- * Exact division changes Newton refinement and zero-mask idioms. */
-static inline float recomp_rcpss(float x) {
-#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
-    return _mm_cvtss_f32(_mm_rcp_ss(_mm_set_ss(x)));
-#else
-    return 1.0f / (fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
-#endif
-}
-static inline float recomp_rsqrtss(float x) {
-#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
-    return _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x)));
-#else
-    return 1.0f / sqrtf(fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
-#endif
-}
-RECOMP_XMM_LANEWISE(XMM_RSQRT, recomp_rsqrtss(b.f[i]))
-RECOMP_XMM_LANEWISE(XMM_RCP, recomp_rcpss(b.f[i]))
-
 /** movmskps: the four lane sign bits, packed into the low nibble. */
 static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
     return ((a.u[0] >> 31) & 1u) | (((a.u[1] >> 31) & 1u) << 1)
@@ -729,6 +801,52 @@ static inline RecompXmm XMM_UNPACK_HIGH(RecompXmm a, RecompXmm b) {
     r.u[0] = a.u[2]; r.u[1] = b.u[2]; r.u[2] = a.u[3]; r.u[3] = b.u[3];
     return r;
 }
+
+/* Packed unary op; the first argument is unused, as for the binary forms. */
+RECOMP_XMM_LANEWISE(XMM_SQRT,  sqrtf(b.f[i]))
+
+#endif /* RECOMP_XMM_SSE */
+
+/* The full SSE compare predicate set, by CMPPS/CMPSS immediate:
+ * 0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ, 5 NLT, 6 NLE, 7 ORD. The N forms are
+ * the negations, so they are true when either side is NaN. */
+static inline int recomp_cmp_pred(float a, float b, int p) {
+    switch (p & 7) {
+    case 0:  return a == b;
+    case 1:  return a < b;
+    case 2:  return a <= b;
+    case 3:  return a != a || b != b;
+    case 4:  return !(a == b);
+    case 5:  return !(a < b);
+    case 6:  return !(a <= b);
+    default: return !(a != a || b != b);
+    }
+}
+static inline RecompXmm XMM_CMP_PRED(RecompXmm a, RecompXmm b, int p) {
+    RecompXmm r; int i;
+    for (i = 0; i < 4; ++i)
+        r.u[i] = recomp_cmp_pred(a.f[i], b.f[i], p) ? 0xFFFFFFFFu : 0u;
+    return r;
+}
+/* Packed unary ops; the first argument is unused, as for the binary forms.
+ * These instructions deliberately approximate and treat denormals as zero.
+ * Exact division changes Newton refinement and zero-mask idioms. */
+static inline float recomp_rcpss(float x) {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return _mm_cvtss_f32(_mm_rcp_ss(_mm_set_ss(x)));
+#else
+    return 1.0f / (fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
+#endif
+}
+static inline float recomp_rsqrtss(float x) {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x)));
+#else
+    return 1.0f / sqrtf(fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
+#endif
+}
+RECOMP_XMM_LANEWISE(XMM_RSQRT, recomp_rsqrtss(b.f[i]))
+RECOMP_XMM_LANEWISE(XMM_RCP, recomp_rcpss(b.f[i]))
 
 /* ================================================================
  * Flag computation helpers
