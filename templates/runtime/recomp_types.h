@@ -506,7 +506,17 @@ void recomp_trace_esp(const char *name, const char *tag);
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
  * our mapping and causing access violations.
  */
-#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + RECOMP_MEM_BASE)
+
+/* The base XBOX_PTR adds. Translated function chunks (RECOMP_LOCAL_MEM_BASE)
+ * switch it to a per-function copy at the end of this header: every guest
+ * store goes through a volatile pointer, which the compiler must assume may
+ * alias any global, so reading the global reloaded it after each store --
+ * one extra load per guest memory access in the hottest code there is. A
+ * local whose address is never taken cannot alias, so it stays in a register.
+ * The base does not move once the memory is mapped. Helpers in this header
+ * keep the global: they are compiled before the switch. */
+#define RECOMP_MEM_BASE g_xbox_mem_offset
 
 /** Read/write N bytes at a flat Xbox memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
@@ -1561,5 +1571,17 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
  * enumerates every site whether or not it is ever reached. */
 void recomp_unimpl(const char *text, uint32_t va);
 #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
+
+/* Last, after every helper above: from here on XBOX_PTR in a translated
+ * chunk uses the copy each translated function declares on entry
+ * (RECOMP_MEM_BASE_DECL). */
+#if defined(RECOMP_GENERATED_CODE) && defined(RECOMP_LOCAL_MEM_BASE)
+#undef RECOMP_MEM_BASE
+#define RECOMP_MEM_BASE _recomp_mem_base
+#define RECOMP_MEM_BASE_DECL \
+    const ptrdiff_t _recomp_mem_base = g_xbox_mem_offset; (void)_recomp_mem_base;
+#else
+#define RECOMP_MEM_BASE_DECL
+#endif
 
 #endif /* RECOMP_TYPES_H */
