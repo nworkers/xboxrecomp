@@ -450,6 +450,19 @@ void recomp_icall_fail_log(uint32_t va);
  * vtable call into an unexplained hang. */
 void recomp_icall_not_code_log(uint32_t va);
 
+/* An unresolved-target stub ran: a call or jump reached an address the
+ * disassembler did not find as a function, so the stub returned without
+ * running the code there. Opt-in, because the project has to implement the
+ * report: with RECOMP_STUB_REPORT defined each stub calls
+ * recomp_unresolved_stub_log(va) (expected to report each address once);
+ * without it a stub stays silent, as before. */
+#ifdef RECOMP_STUB_REPORT
+void recomp_unresolved_stub_log(uint32_t va);
+#define RECOMP_UNRESOLVED_STUB(va) recomp_unresolved_stub_log(va)
+#else
+#define RECOMP_UNRESOLVED_STUB(va) ((void)0)
+#endif
+
 /* Indirect-branch target feedback. The ring buffer above is crash forensics --
  * 16 entries, overwritten constantly. This is a durable, deduplicated record of
  * every target the title ever reached, for feeding back into the next codegen

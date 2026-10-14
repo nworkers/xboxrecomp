@@ -210,6 +210,13 @@ def _is_safe_icall(line):
         "RECOMP_ICALL_SAFE_CC", "RECOMP_ICALL_SAFE_AT_CC"))
 
 
+def _stub_definition(name: str, addr: int, popped: int) -> str:
+    """One unresolved-target stub: report, then return as a `ret popped` would."""
+    note = f"ret {popped}" if popped else "not detected"
+    return (f"void {name}(void) {{ RECOMP_UNRESOLVED_STUB(0x{addr:08X}u); "
+            f"g_esp += {4 + popped}; /* 0x{addr:08X}: {note} */ }}")
+
+
 def _fixup_icall_esp_save(lines):
     """
     Post-process generated C lines to insert _icall_esp save points.
@@ -3526,15 +3533,19 @@ class BatchTranslator:
             stub_lines.append(
                 " * they end in a `ret N` -- guessing cdecl there silently walks")
             stub_lines.append(
-                " * esp off by N on every call. */")
+                " * esp off by N on every call.")
+            stub_lines.append(
+                " *")
+            stub_lines.append(
+                " * A stub that runs means code the original executes was skipped,")
+            stub_lines.append(
+                " * so each one says so through RECOMP_UNRESOLVED_STUB (a no-op")
+            stub_lines.append(
+                " * unless the project defines RECOMP_STUB_REPORT). */")
             stub_lines.append("")
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
-                note = (f"ret {popped}" if popped else "not detected")
-                stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
-                    f"/* 0x{addr:08X}: {note} */ }}"
-                )
+                stub_lines.append(_stub_definition(unresolved[addr], addr, popped))
             stub_lines.append("")
 
             write_if_changed(stub_path, "\n".join(stub_lines))
