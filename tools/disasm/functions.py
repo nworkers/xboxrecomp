@@ -165,6 +165,17 @@ class FunctionDetector:
         # every alias is known, because those bodies exist only from here on.
         self._pass_alias_branch_orphans()
 
+        # Branches into another function's interior, measured on the final
+        # bodies: the passes above can split a body after the tail-jump pass
+        # has already looked at its branches.
+        self._pass_branches_into_bodies()
+
+        # Tail jumps and conditional branches out of bodies made after pass 6,
+        # into gaps. A recovered block can itself branch into another body's
+        # interior, so that pass looks once more.
+        if self._pass_late_tail_jumps(sections):
+            self._pass_branches_into_bodies()
+
         self._build_alias_entries()
 
         # Populate call graph
@@ -1062,6 +1073,200 @@ class FunctionDetector:
         if added_any:
             print("  blocks recovered that alias bodies branch to")
         return added_any
+    def _pass_branches_into_bodies(self) -> bool:
+        """
+        A jmp or jcc that leaves its function for the interior of another one.
+
+        _pass_tail_jump_targets makes such a jmp target an alias entry, but it
+        runs before _pass_imm_ref_targets and _pass_gap_prologues, which can
+        still split a body; a branch that was intra-function when it looked
+        becomes a branch into a neighbour afterwards. And it never takes a
+        jcc (a jcc past its own end usually means a body measured short, and
+        a function start there would split it), while _pass_cond_branch_orphans
+        takes only jcc targets in gaps. A jcc into another body fell between
+        the two. Either way the branch was lowered to an unresolved-target
+        stub that pops only a return address.
+
+        Jet Set Radio Future's 0x0007E180 hit both gaps at once. It is reached
+        only from a vtable, so it is itself an alias with no function body
+        around it -- which is why alias ranges count as sources here. Its shared
+        `pop esi; ret` tail at 0x0007E255 is reached by four jcc, and
+        _pass_gap_prologues made a function of the block before it
+        (0x0007E242, right after a ret), cutting 0x0007E180 short. The four
+        branches then pointed into sub_0007E242, each returned through a stub
+        with esp 4 low and esi unrestored, and a scene-graph walk two callers
+        up followed a garbage sibling pointer.
+
+        An alias entry is safe here for the same reason as in the jmp pass:
+        aliases are built after the bodies, so they cannot clamp anyone's end.
+        The target must be an instruction the sweep decoded; it lies in code
+        already lifted as part of a body, which is the evidence a gap target
+        lacks (and _pass_cond_branch_orphans still asks a ret of).
+        """
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bodies]
+
+        def containing(addr: int):
+            i = bisect.bisect_right(starts, addr) - 1
+            if i >= 0 and addr < bodies[i][1]:
+                return bodies[i]
+            return None
+
+        added = 0
+        while True:
+            # A branch is examined from every body it lies in: its function's,
+            # and any alias range (an alias reached only from data can sit in a
+            # gap, with no function body around it at all).
+            aliases = sorted(self._alias_entries.items())
+            alias_starts = [a[0] for a in aliases]
+
+            def sources(addr: int):
+                found = []
+                body = containing(addr)
+                if body is not None:
+                    found.append(body)
+                # Aliases rarely nest more than a few deep; the nearest
+                # starts at or below addr are the only ones that can hold it.
+                k = bisect.bisect_right(alias_starts, addr)
+                for start, end in aliases[max(0, k - 8):k]:
+                    if addr < end:
+                        found.append((start, end))
+                return found
+
+            new = 0
+            for insn in self.engine.instructions.values():
+                if not (insn.is_jump or insn.is_cond_jump):
+                    continue
+                target = insn.jump_target
+                if target is None or target in self._alias_entries:
+                    continue
+                if target in self.functions or target in self._candidates:
+                    continue
+                around = sources(insn.address)
+                if not around or any(lo <= target < hi for lo, hi in around):
+                    continue                # outside any body, or intra-body
+                body = containing(target)
+                if body is None or body[0] == target:
+                    continue                # a gap (other passes), or a function start
+                if target not in self.engine.instructions:
+                    continue                # not on an instruction boundary
+                self._alias_entries[target] = body[1]
+                new += 1
+            if not new:
+                break
+            added += new                    # a new alias can branch onward itself
+        if added:
+            print(f"  {added} branch target(s) inside another function recovered as alias entries")
+        return added > 0
+
+    def _pass_late_tail_jumps(self, sections: Optional[List[SectionInfo]] = None) -> bool:
+        """
+        A tail jump into a gap from a body that pass 6 never saw.
+
+        _pass_tail_jump_targets takes the target of every jmp that leaves its
+        function, but only over the bodies pass 5 built. _pass_gap_prologues
+        makes functions after it, and the alias passes make bodies later still;
+        their jmps into a gap were looked at by nobody. _pass_branches_into_bodies
+        takes only targets inside another body, and the alias orphan pass asks
+        a short probe to reach a ret, which a long function never does. The
+        target was then lowered to an unresolved-target stub that pops only a
+        return address: the whole function silently never ran.
+
+        Jet Set Radio Future hit it seven times. One runs on every frame of the
+        attract demo: a state handler reached through a 119-entry table
+        (0x0005BB31, a gap prologue) ends in `jmp 0x00054750`, an ordinary
+        function aligned after nop padding that nothing ever calls.
+
+        The evidence is the same as pass 6's -- an unconditional jmp out of its
+        own body is a tail call -- so no probe is asked. The target becomes an
+        alias entry rather than a candidate, which cannot cut any body short;
+        _build_alias_entries measures it. Repeats, since a recovered body can
+        tail-jump onward itself.
+
+        A jcc out of a late body into a gap was missed the same way, since
+        _pass_cond_branch_orphans runs inside pass 6. It is taken here with
+        that pass's acceptance test, because a jcc past a body's end can also
+        mean the body was measured short: the target must decode to a
+        returning body, a vcall thunk, or a block ending in a jmp -- direct, or
+        indirect (a tail call through a vtable slot, or a switch), which the
+        alias orphan pass refused. Jet Set Radio Future had two: a method's
+        `je` to a block forwarding to `[ecx+0x20]` (0x001783FE, so esp came back
+        12 low through the stub), and a switch arm's `je` to its function's
+        shared epilogue (0x001296C7, `add esp, 0xc04; ret` never ran).
+        """
+        added = 0
+        while True:
+            bodies = sorted((f.start, f.end) for f in self.functions.values())
+            starts = [b[0] for b in bodies]
+
+            def claimed(addr: int) -> bool:
+                i = bisect.bisect_right(starts, addr) - 1
+                return i >= 0 and addr < bodies[i][1]
+
+            # Function bodies, plus aliases sitting in a gap, measured as their
+            # own bodies (an alias inside a body is covered by that body).
+            all_starts = sorted(set(starts) | set(self._alias_entries))
+            sources = list(bodies)
+            for alias, bound in sorted(self._alias_entries.items()):
+                if alias in self.functions or claimed(alias):
+                    continue
+                k = bisect.bisect_right(all_starts, alias)
+                upper = min(bound, all_starts[k]) if k < len(all_starts) else bound
+                sources.append((alias, self._find_function_end(alias, upper, upper)))
+            gap_bodies = sorted(s for s in sources if s[0] not in self.functions)
+
+            def in_gap_body(addr: int) -> bool:
+                return any(lo <= addr < hi for lo, hi in gap_bodies)
+
+            # Only instructions control can reach: bytes after a body's last
+            # jmp lie in its measured range too, and may decode as a branch.
+            entries = list(self.functions) + list(self._alias_entries)
+            for table in self.engine.jump_tables:
+                entries.extend(self.engine.jump_table_entries(table))
+            bounds = ([(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections] if sections else [(0, 1 << 32)])
+            reachable = self.engine.recursive_descent(entries, bounds)
+
+            new = 0
+            for lo, hi in sources:
+                for insn in self.engine.get_instructions_in_range(lo, hi):
+                    if insn.address not in reachable:
+                        continue
+                    if not (insn.is_jump or insn.is_cond_jump):
+                        continue
+                    target = insn.jump_target
+                    if target is None or lo <= target < hi:
+                        continue                # intra-body
+                    if (target in self.functions or target in self._candidates
+                            or target in self._alias_entries):
+                        continue
+                    if claimed(target) or in_gap_body(target):
+                        continue                # into a body: other passes
+                    if target not in self.engine.instructions:
+                        continue                # not on an instruction boundary
+                    section = self.image.get_section_at_va(target)
+                    if section is None or not section.executable:
+                        continue
+                    if insn.is_cond_jump and not self._branch_block_ends(target):
+                        continue                # maybe a body measured short
+                    k = bisect.bisect_right(all_starts, target)
+                    self._alias_entries[target] = (
+                        all_starts[k] if k < len(all_starts)
+                        else section.virtual_addr + section.virtual_size)
+                    new += 1
+            if not new:
+                break
+            added += new
+        if added:
+            print(f"  {added} branch target(s) from late bodies recovered as alias entries")
+        return added > 0
+
+    def _branch_block_ends(self, target: int) -> bool:
+        """Whether a conditional-branch target in a gap ends like a block of code."""
+        return (self.engine.probes_as_returning_body(target, max_insns=256)
+                or self.engine.probes_as_vcall_thunk(target)
+                or self.engine.block_tail_jump(target) is not None
+                or self.engine.block_ends_in_indirect_jump(target))
 
     def _build_alias_entries(self) -> None:
         """

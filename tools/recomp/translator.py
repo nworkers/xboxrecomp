@@ -1314,13 +1314,33 @@ class FunctionTranslator:
         reachable code, up to its table, as a function of its own. Existing
         bodies are unchanged.
 
+        An arm recovered this way can hold a switch of its own, which it also
+        emits as an indirect tail call, so the new entries are scanned in turn
+        until none appear. A recovered body inlines only the tables its
+        recovery found, so for it an arm inside the body still needs an entry.
+        Jet Set Radio Future's 0x00129180 reaches arm 0x001297EC through one
+        table, and that arm -- recovered up to that table, which spans its
+        arms -- dispatches through another (0x0012A5BC) past it, whose eight
+        arms had entries only while a neighbouring body happened to provide
+        them.
+
         Run after discover_cfg_ownership, which settles translated bounds.
         """
         self._extend_over_trailing_tables()
+        scan = [start for start in self.func_db
+                if start not in self.owned_function_starts]
+        all_tables = set()
+        while scan:
+            added = self._discover_arm_entries(scan, all_tables)
+            scan = sorted(added)
+        return self.jump_table_entry_starts
+
+    def _discover_arm_entries(self, starts, all_tables):
+        """One round of discover_jump_table_entries over `starts`; returns the
+        arm entries it added."""
         sites = []
-        for start, info in self.func_db.items():
-            if start in self.owned_function_starts:
-                continue
+        for start in starts:
+            info = self.func_db[start]
             recovered = self._recovered_cfg.get(start)
             if recovered:
                 end = recovered["end"]
@@ -1342,19 +1362,24 @@ class FunctionTranslator:
                 if operand.mem_disp in known:
                     continue  # recovered as an in-function switch
                 if operand.mem_index and not operand.mem_base:
-                    sites.append((start, end, operand.mem_disp))
+                    sites.append((start, end, operand.mem_disp,
+                                  recovered is not None))
 
         # A table ends where the next indexed jump's table begins.
-        tables = sorted({table for _, _, table in sites})
+        all_tables.update(table for _, _, table, _ in sites)
+        tables = sorted(all_tables)
         arms = {}
-        for start, end, table in sites:
+        for start, end, table, recovered in sites:
             following = bisect.bisect_right(tables, table)
             limit = table + 4 * 256
             if following < len(tables):
                 limit = min(limit, tables[following])
             # MSVC places a switch table after the code it indexes.
             targets = self._read_bounded_jump_table(table, start, limit)
-            if all(start <= target < end for target in targets):
+            # A recovered body inlines only the tables its recovery found
+            # (`known` above); any other table is an indirect tail call even
+            # when every arm lies inside the body.
+            if not recovered and all(start <= target < end for target in targets):
                 continue  # lifted as in-function gotos
             for target in targets:
                 if target not in self.func_db:
@@ -1362,6 +1387,7 @@ class FunctionTranslator:
                     callers.add(start)
                     arms[target] = (callers, min(upper, table))
 
+        added = set()
         for target, (callers, upper) in sorted(arms.items()):
             recovered = self._recover_cfg(target, upper, set(), set())
             if recovered is None or not recovered[0]:
@@ -1394,8 +1420,8 @@ class FunctionTranslator:
                 "jump_tables": jump_tables,
             }
             self.jump_table_entry_starts.add(target)
-
-        return self.jump_table_entry_starts
+            added.add(target)
+        return added
 
     def _extend_over_trailing_tables(self):
         """Extend a function cut at its own inline jump tables.
